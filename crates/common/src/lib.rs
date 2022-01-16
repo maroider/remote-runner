@@ -22,6 +22,64 @@ pub struct Version {
     pub patch: u32,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub enum ServerCmd {
+    Run(RunExecutable),
+    UpgradeSelf(SelfUpdate),
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct RunExecutable {
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
+impl fmt::Debug for RunExecutable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunExecutable")
+            .field("name", &self.name)
+            .field("data", &[0])
+            .finish()
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct SelfUpdate {
+    pub data: Vec<u8>,
+}
+
+impl fmt::Debug for SelfUpdate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SelfUpdate").field("data", &[0]).finish()
+    }
+}
+
+pub struct ServerUpdate {
+    pub panicked: bool,
+    pub stdio: StdioBytes,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct StdioBytes {
+    pub stream: StdStream,
+    pub data: Vec<u8>,
+}
+
+impl fmt::Debug for StdioBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StdioBytes")
+            .field("stream", &self.stream)
+            .field("data", &[0])
+            .finish()
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum StdStream {
+    Stdout,
+    Stderr,
+}
+
 pub fn read_message<T>(data: &mut Vec<u8>) -> Result<T, MessageReadError>
 where
     for<'de> T: Deserialize<'de>,
