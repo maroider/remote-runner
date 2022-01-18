@@ -5,8 +5,20 @@ use std::{
 };
 
 use tokio::{net::TcpListener, process::Command};
-use tracing::{debug, error, trace, Level};
+use tracing::{debug, error, Level};
 use tracing_subscriber::{fmt::format, FmtSubscriber};
+
+macro_rules! lc_err {
+    ($e:expr) => {
+        match $e {
+            Ok(ok) => ok,
+            Err(err) => {
+                error!("{err}");
+                continue;
+            }
+        }
+    };
+}
 
 fn main() {
     let subscriber = FmtSubscriber::builder()
@@ -14,7 +26,6 @@ fn main() {
         .with_max_level(Level::TRACE)
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("Could not set default subscriber");
-    tracing::info!("Hello tracing");
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -29,67 +40,10 @@ fn main() {
         .await
         .unwrap();
 
-        let mut rbuf = Vec::new();
-        let mut wbuf = Vec::new();
+        let mut mread = common::MessageReader::new();
+        let mut mwrite = common::MessageWriter::new();
 
-        'main: loop {
-            macro_rules! read_message {
-                ($stream:ident, $msg:ty) => {
-                    loop {
-                        use tokio::io::AsyncReadExt;
-                        match $stream.read_buf(&mut rbuf).await {
-                            Ok(num) => {
-                                if num == 0 {
-                                    error!(
-                                        "Read {num} bytes. Assuming the other end is disconnected."
-                                    );
-                                    continue 'main;
-                                } else {
-                                    trace!("Read {num} bytes");
-                                }
-                            }
-                            Err(err) => {
-                                error!("Reading from TCP stream failed: {}", err);
-                                continue 'main;
-                            }
-                        }
-                        match common::read_message::<$msg>(&mut rbuf) {
-                            Ok(msg) => {
-                                trace!("Received message: {msg:?}");
-                                break msg;
-                            }
-                            Err(err) if err.data_too_short() => {
-                                trace!("Data buffer too short ... reading more bytes");
-                                // Read more bytes
-                                continue;
-                            }
-                            Err(err) => {
-                                error!("Deserializing from buffer failed: {}", err);
-                                continue 'main;
-                            }
-                        }
-                    }
-                };
-            }
-
-            macro_rules! write_message {
-                ($stream:ident, $msg:expr) => {{
-                    use tokio::io::AsyncWriteExt;
-                    if let Err(err) = common::write_message(&mut wbuf, $msg) {
-                        error!("Serializing message failed: {}", err);
-                        continue;
-                    }
-                    if let Err(err) = $stream.write_all(&mut wbuf).await {
-                        error!("Writing to TCP stream failed: {}", err);
-                        continue;
-                    }
-                    wbuf.clear();
-                }};
-            }
-
-            rbuf.clear();
-            wbuf.clear();
-
+        loop {
             debug!("Listening for new connections");
             let (mut stream, peer_socket_addr) = match listener.accept().await {
                 Ok(ok) => ok,
@@ -99,16 +53,20 @@ fn main() {
                 }
             };
             debug!("Accepted connection on {}", peer_socket_addr);
-            write_message!(
-                stream,
-                &common::Version {
-                    major: 0,
-                    minor: 1,
-                    patch: 0,
-                }
+            lc_err!(
+                mwrite
+                    .write_message(
+                        &mut stream,
+                        &common::Version {
+                            major: 0,
+                            minor: 1,
+                            patch: 0,
+                        },
+                    )
+                    .await
             );
             debug!("Server version sent");
-            let version = read_message!(stream, common::Version);
+            let version = lc_err!(mread.read_message::<common::Version, _>(&mut stream).await);
             debug!(
                 "Client version received: {}.{}.{}",
                 version.major, version.minor, version.patch
@@ -118,7 +76,10 @@ fn main() {
             }
 
             debug!("Waiting for a command");
-            let cmd = read_message!(stream, common::ServerCmd);
+            let cmd = mread
+                .read_message::<common::ServerCmd, _>(&mut stream)
+                .await;
+            let cmd = lc_err!(cmd);
             match cmd {
                 common::ServerCmd::Run(executable) => {
                     use tokio::io::AsyncWriteExt;
@@ -144,7 +105,9 @@ fn main() {
                     tokio::spawn(async move {
                         let _stderr = process.stderr.unwrap();
                     });
-                    read_message!(stream, ());
+
+                    // Temporary dummy read
+                    lc_err!(mread.read_message::<(), _>(&mut stream).await);
                 }
                 common::ServerCmd::UpgradeSelf(_upgrade) => {
                     todo!();

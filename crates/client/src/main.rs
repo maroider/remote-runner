@@ -7,7 +7,6 @@ use std::thread;
 use console::style;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tracing::{error, trace};
 use tracing_subscriber::fmt::format;
 use tracing_subscriber::FmtSubscriber;
 
@@ -110,65 +109,24 @@ fn spawn_worker_thread(server_addr: &SocketAddr, action: Action) -> mpsc::Unboun
                 style(server_addr).bold()
             );
 
-            let mut rbuf = Vec::new();
-            let mut wbuf = Vec::new();
-
-            macro_rules! read_message {
-                ($stream:ident, $msg:ty) => {{
-                    use tokio::io::AsyncReadExt;
-                    trace!("Reading from stream to buffer");
-                    match $stream.read_buf(&mut rbuf).await {
-                        Ok(num) => {
-                            if num == 0 {
-                                error!("Read {num} bytes. Assuming the other end is disconnected.");
-                                return;
-                            } else {
-                                trace!("Read {num} bytes");
-                            }
-                        }
-                        Err(err) => errored!(err),
-                    }
-                    match common::read_message::<$msg>(&mut rbuf) {
-                        Ok(msg) => {
-                            trace!("Received message {:?}", msg);
-                            msg
-                        }
-                        Err(err) if !err.data_too_short() => {
-                            errored!(err);
-                            return;
-                        }
-                        Err(err) => {
-                            errored!(err);
-                            return;
-                        }
-                    }
-                }};
-            }
-
-            macro_rules! write_message {
-                ($stream:ident, $msg:expr) => {{
-                    use tokio::io::AsyncWriteExt;
-                    if let Err(err) = common::write_message(&mut wbuf, $msg) {
-                        errored!(err);
-                        return;
-                    }
-                    if let Err(err) = $stream.write_all(&mut wbuf).await {
-                        errored!(err);
-                        return;
-                    }
-                    wbuf.clear();
-                }};
-            }
+            let mut mread = common::MessageReader::new();
+            let mut mwrite = common::MessageWriter::new();
 
             match TcpStream::connect(&server_addr).await {
                 Ok(mut stream) => {
-                    let _server_version = read_message!(stream, common::Version);
+                    let server_version = mread
+                        .read_message::<common::Version, _>(&mut stream)
+                        .await
+                        .unwrap();
                     let client_version = common::Version {
                         major: 0,
                         minor: 1,
                         patch: 0,
                     };
-                    write_message!(stream, &client_version);
+                    mwrite
+                        .write_message(&mut stream, &client_version)
+                        .await
+                        .unwrap();
 
                     match action {
                         Action::Run(executable) => {
@@ -183,13 +141,16 @@ fn spawn_worker_thread(server_addr: &SocketAddr, action: Action) -> mpsc::Unboun
                                 style(&name).bold()
                             );
                             let data = tokio::fs::read(executable).await.unwrap();
-                            write_message!(
-                                stream,
-                                &common::ServerCmd::Run(common::RunExecutable {
-                                    name: name.clone(),
-                                    data
-                                })
-                            );
+                            mwrite
+                                .write_message(
+                                    &mut stream,
+                                    &common::ServerCmd::Run(common::RunExecutable {
+                                        name: name.clone(),
+                                        data,
+                                    }),
+                                )
+                                .await
+                                .unwrap();
                             mprintln!(
                                 "{} Running {}",
                                 style("[3/3]").bold().dim(),

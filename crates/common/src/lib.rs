@@ -1,11 +1,10 @@
 use std::fmt;
+use std::io;
 use std::io::{Cursor, Seek, SeekFrom};
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use serde::{Deserialize, Serialize};
-
-pub use bincode;
-use tracing::trace;
+use tracing::{error, trace};
 
 pub fn default_socket_address() -> SocketAddrV4 {
     SocketAddrV4::new(Ipv4Addr::LOCALHOST, default_port())
@@ -80,57 +79,148 @@ pub enum StdStream {
     Stderr,
 }
 
-pub fn read_message<T>(data: &mut Vec<u8>) -> Result<T, MessageReadError>
-where
-    for<'de> T: Deserialize<'de>,
-{
-    trace!("Reading message from data buffer of {} bytes", data.len());
-    let mut cursor = Cursor::new(&*data);
-    let len: u32 = bincode::deserialize_from(&mut cursor).map_err(MessageReadError::Bincode)?;
-    trace!("Message length should be {}", len);
-    if ((data.len() - cursor.position() as usize) as u32) < len {
-        return Err(MessageReadError::DataTooShort);
+pub struct MessageReader {
+    buf: Vec<u8>,
+}
+
+impl MessageReader {
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
     }
-    let message = bincode::deserialize_from(&mut cursor).map_err(MessageReadError::Bincode)?;
-    let written = cursor.position() as usize;
-    let _ = data.drain(..written);
-    Ok(message)
+
+    pub async fn read_message<T, S>(&mut self, stream: &mut S) -> Result<T, MessageReadError>
+    where
+        for<'de> T: Deserialize<'de> + fmt::Debug,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        loop {
+            use tokio::io::AsyncReadExt;
+
+            match stream.read_buf(&mut self.buf).await {
+                Ok(num) => {
+                    if num == 0 {
+                        error!("Read {num} bytes. Assuming the other end is disconnected.");
+                        return Err(MessageReadError::NoBytesRead);
+                    } else {
+                        trace!("Read {num} bytes");
+                    }
+                }
+                Err(err) => {
+                    error!("Reading from TCP stream failed: {err}");
+                    return Err(MessageReadError::StreamRead(err));
+                }
+            }
+
+            trace!(
+                "Reading message from data buffer of {} bytes",
+                self.buf.len(),
+            );
+            let mut cursor = Cursor::new(&*self.buf);
+            let len: u32 = bincode::deserialize_from(&mut cursor).map_err(|err| {
+                error!("Deserializing from buffer failed: {err}");
+                MessageReadError::Bincode(err)
+            })?;
+            trace!("Message length should be {len}");
+
+            if ((self.buf.len() - cursor.position() as usize) as u32) < len {
+                trace!("Buffer does not contain sufficient data yet ...");
+                continue;
+            }
+
+            let message = bincode::deserialize_from(&mut cursor).map_err(|err| {
+                error!("Deserializing from buffer failed: {err}");
+                MessageReadError::Bincode(err)
+            })?;
+            let written = cursor.position() as usize;
+            let _ = self.buf.drain(..written);
+
+            trace!("Received message: {message:?}");
+            return Ok(message);
+        }
+    }
+}
+
+pub struct MessageWriter {
+    buf: Vec<u8>,
+}
+
+impl MessageWriter {
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    pub async fn write_message<T, S>(
+        &mut self,
+        stream: &mut S,
+        msg: &T,
+    ) -> Result<usize, MessageWriteError>
+    where
+        T: Serialize,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
+
+        let mut cursor = Cursor::new(&mut self.buf);
+        bincode::serialize_into(&mut cursor, &0u32).map_err(|err| {
+            error!("Serializing message failed: {err}");
+            MessageWriteError::Serialize(err)
+        })?;
+        let base = cursor.position();
+        bincode::serialize_into(&mut cursor, msg).map_err(|err| {
+            error!("Serializing message failed: {err}");
+            MessageWriteError::Serialize(err)
+        })?;
+        let written = cursor.position() - base;
+        cursor.seek(SeekFrom::Start(0)).unwrap();
+        bincode::serialize_into(&mut cursor, &(written as u32)).map_err(|err| {
+            error!("Serializing message failed: {err}");
+            MessageWriteError::Serialize(err)
+        })?;
+
+        if let Err(err) = stream.write_all(&mut self.buf).await {
+            error!("Writing to TCP stream failed: {err}");
+            return Err(MessageWriteError::StreamWrite(err));
+        }
+        self.buf.clear();
+
+        Ok(written as usize)
+    }
 }
 
 #[derive(Debug)]
 pub enum MessageReadError {
-    DataTooShort,
+    /// No bytes read, assuming disconnect
+    NoBytesRead,
+    /// Reading from the stream failed
+    StreamRead(io::Error),
     Bincode(bincode::Error),
-}
-
-impl MessageReadError {
-    pub fn data_too_short(&self) -> bool {
-        matches!(self, &Self::DataTooShort)
-    }
 }
 
 impl fmt::Display for MessageReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MessageReadError::DataTooShort => write!(
+            MessageReadError::NoBytesRead => write!(
                 f,
-                "The data buffer does not contain enough bytes to deserialize the message"
+                "Read 0 bytes from stream. The other end has likely disconnected."
             ),
+            MessageReadError::StreamRead(err) => write!(f, "Could not read from stream: {err}"),
             MessageReadError::Bincode(err) => err.fmt(f),
         }
     }
 }
 
-pub fn write_message<T>(buf: &mut Vec<u8>, message: &T) -> Result<usize, bincode::Error>
-where
-    T: Serialize,
-{
-    let mut cursor = Cursor::new(buf);
-    bincode::serialize_into(&mut cursor, &0u32)?;
-    let base = cursor.position();
-    bincode::serialize_into(&mut cursor, message)?;
-    let written = cursor.position() - base;
-    cursor.seek(SeekFrom::Start(0)).unwrap();
-    bincode::serialize_into(&mut cursor, &(written as u32))?;
-    Ok(written as usize)
+#[derive(Debug)]
+pub enum MessageWriteError {
+    Serialize(bincode::Error),
+    StreamWrite(io::Error),
+}
+impl fmt::Display for MessageWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MessageWriteError::Serialize(err) => write!(f, "Could not serialize message: {err}"),
+            MessageWriteError::StreamWrite(err) => {
+                write!(f, "Could not write message to stream: {err}")
+            }
+        }
+    }
 }
