@@ -9,6 +9,7 @@ use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::OnceCell;
+use tracing::info;
 use tracing::trace;
 use tracing::{debug, error, Level};
 use tracing_subscriber::{fmt::format, FmtSubscriber};
@@ -137,12 +138,13 @@ fn main() {
                         )
                     });
                     let (rstream, mut wstream) = stream.into_split();
-                    tokio::spawn({
+                    let process = tokio::spawn({
+                        let iotx = iotx.clone();
                         async move {
-                            loop {
+                            let msg = loop {
                                 if let Some(_) = stdio_err.get() {
                                     trace!("Error set");
-                                    break;
+                                    break InternalMessage::Stop;
                                 }
                                 match rstream.try_read(&mut [0]) {
                                     Ok(written) => {
@@ -150,24 +152,29 @@ fn main() {
                                             error!(
                                                 "0 bytes read. Assuming the client disconnected..."
                                             );
-                                            break;
+                                            break InternalMessage::Stop;
                                         }
                                     }
                                     Err(err) => match err.kind() {
                                         io::ErrorKind::WouldBlock => {}
                                         _ => {
                                             error!("{err}");
-                                            break;
+                                            break InternalMessage::Stop;
                                         }
                                     },
                                 }
+                                if process.try_wait().is_ok() {
+                                    debug!("Process exited on its own");
+                                    break InternalMessage::ProcessExited;
+                                }
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            }
-                            iotx.send(InternalMessage::Stop).await.unwrap();
+                            };
+                            iotx.send(msg).await.unwrap();
+                            process
                         }
                     });
                     trace!("Entering loop");
-                    loop {
+                    let stop_process = loop {
                         if let Some(msg) = iorx.recv().await {
                             match msg {
                                 InternalMessage::Stdio(stdio) => {
@@ -182,19 +189,24 @@ fn main() {
                                         .await
                                     {
                                         error!("Failed to write message to stream: {err}");
-                                        break;
+                                        break true;
                                     }
                                 }
                                 InternalMessage::Stop => {
                                     trace!("Stop message received");
-                                    break;
+                                    break true;
+                                }
+                                InternalMessage::ProcessExited => {
+                                    break false;
                                 }
                             }
                         }
-                    }
-                    trace!("Exiting loop ... killing process");
-                    if let Err(err) = process.kill().await {
-                        error!("Failed to kill process: {err}");
+                    };
+                    if stop_process {
+                        trace!("Exiting loop ... killing process");
+                        if let Err(err) = process.await.unwrap().kill().await {
+                            error!("Failed to kill process: {err}");
+                        }
                     }
                 }
                 common::ServerCmd::UpgradeSelf(_upgrade) => {
@@ -209,6 +221,7 @@ fn main() {
 enum InternalMessage {
     Stdio(common::StdioBytes),
     Stop,
+    ProcessExited,
 }
 
 async fn redirect_stdio<S>(
@@ -228,12 +241,15 @@ async fn redirect_stdio<S>(
             return;
         }
         if !buf.is_empty() {
-            iotx.send(InternalMessage::Stdio(common::StdioBytes {
-                stream,
-                data: buf.clone(),
-            }))
-            .await
-            .unwrap();
+            if let Err(err) = iotx
+                .send(InternalMessage::Stdio(common::StdioBytes {
+                    stream,
+                    data: buf.clone(),
+                }))
+                .await
+            {
+                error!("{err}");
+            }
             buf.clear();
         }
     }
