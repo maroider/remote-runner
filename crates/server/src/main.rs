@@ -97,7 +97,7 @@ fn main() {
             let cmd = lc_err!(cmd);
             match cmd {
                 common::ServerCmd::Run(executable) => {
-                    use tokio::io::AsyncWriteExt;
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
                     // FIXME: Signal potential write errors back to the client...
                     debug!("Writing executable data to ./{}", executable.name);
@@ -137,7 +137,7 @@ fn main() {
                         )
                     });
                     let (rstream, mut wstream) = stream.into_split();
-                    let process = tokio::spawn({
+                    let task = tokio::spawn({
                         let iotx = iotx.clone();
                         async move {
                             let msg = loop {
@@ -169,7 +169,7 @@ fn main() {
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             };
                             iotx.send(msg).await.unwrap();
-                            process
+                            (process, rstream)
                         }
                     });
                     trace!("Entering loop");
@@ -201,10 +201,16 @@ fn main() {
                             }
                         }
                     };
+                    let (mut process, mut rstream) = task.await.unwrap();
                     wstream.shutdown().await.unwrap();
+                    while let Ok(read) = rstream.read(&mut [0]).await {
+                        if read == 0 {
+                            break;
+                        }
+                    }
                     if stop_process {
                         trace!("Exiting loop ... killing process");
-                        if let Err(err) = process.await.unwrap().kill().await {
+                        if let Err(err) = process.kill().await {
                             error!("Failed to kill process: {err}");
                         }
                     }
