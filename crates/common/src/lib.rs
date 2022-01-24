@@ -11,7 +11,7 @@ pub fn default_socket_address() -> SocketAddrV4 {
 }
 
 pub fn default_port() -> u16 {
-    4444
+    5555
 }
 
 #[derive(Debug, Deserialize, Serialize)]
