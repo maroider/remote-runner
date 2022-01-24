@@ -19,9 +19,6 @@ fn main() {
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("Could not set default subscriber");
 
-    if env::args_os().nth(1).is_none() {
-        loop {}
-    }
     let arg = env::args_os().nth(1).expect("No argument provided");
     let action = if arg.to_str().map_or(false, |arg| arg == "--upgrade") {
         Action::Upgrade
@@ -50,11 +47,11 @@ fn main() {
         };
 
         match resp {
-            Resp::Print(buf) => {
+            Resp::Print(stdio) => {
                 use std::io::Write;
                 let stdout = std::io::stdout();
                 let mut stdout = stdout.lock();
-                stdout.write(&buf).unwrap();
+                stdout.write_all(&stdio.data).unwrap();
                 stdout.flush().unwrap();
             }
             Resp::Quit => {
@@ -84,7 +81,14 @@ fn spawn_worker_thread(server_addr: &SocketAddr, action: Action) -> mpsc::Unboun
             {
                 use std::io::Write;
                 writeln!(&mut buf, $($arg)*).unwrap();
-                tx.send(Resp::Print(buf.clone())).unwrap();
+                tx.send(
+                    Resp::Print(
+                        common::StdioBytes {
+                            stream: common::StdStream::Stdout,
+                            data: buf.clone()
+                        }
+                    )
+                ).unwrap();
                 buf.clear();
             }
         }
@@ -99,6 +103,7 @@ fn spawn_worker_thread(server_addr: &SocketAddr, action: Action) -> mpsc::Unboun
     thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_io()
+            .enable_time()
             .build()
             .unwrap();
         let _guard = rt.enter();
@@ -114,7 +119,7 @@ fn spawn_worker_thread(server_addr: &SocketAddr, action: Action) -> mpsc::Unboun
 
             match TcpStream::connect(&server_addr).await {
                 Ok(mut stream) => {
-                    let server_version = mread
+                    let _server_version = mread
                         .read_message::<common::Version, _>(&mut stream)
                         .await
                         .unwrap();
@@ -157,9 +162,48 @@ fn spawn_worker_thread(server_addr: &SocketAddr, action: Action) -> mpsc::Unboun
                                 style(&name).bold()
                             );
 
-                            // FIXME: Don't do a busy loop
-                            while !CTRL_C.load(Ordering::SeqCst) {}
-                            tx.send(Resp::Quit).unwrap();
+                            #[derive(Debug)]
+                            enum InternalMsg {
+                                Stdio(common::StdioBytes),
+                                Quit,
+                            }
+
+                            let (itx, mut irx) = mpsc::channel(1);
+                            let (mut rstream, wstream) = stream.into_split();
+                            tokio::spawn({
+                                let itx = itx.clone();
+                                async move {
+                                    while !CTRL_C.load(Ordering::SeqCst) {
+                                        tokio::time::sleep(std::time::Duration::from_millis(100))
+                                            .await;
+                                    }
+                                    itx.send(InternalMsg::Quit).await.unwrap();
+                                    wstream.forget();
+                                }
+                            });
+                            tokio::spawn({
+                                let itx = itx;
+                                async move {
+                                    loop {
+                                        let update = mread
+                                            .read_message::<common::ServerUpdate, _>(&mut rstream)
+                                            .await
+                                            .unwrap();
+                                        if update.panicked {
+                                            // TODO: Is this even useful?
+                                        }
+                                        itx.send(InternalMsg::Stdio(update.stdio)).await.unwrap();
+                                    }
+                                }
+                            });
+                            while let Some(msg) = irx.recv().await {
+                                match msg {
+                                    InternalMsg::Stdio(stdio) => {
+                                        tx.send(Resp::Print(stdio)).unwrap()
+                                    }
+                                    InternalMsg::Quit => tx.send(Resp::Quit).unwrap(),
+                                }
+                            }
                         }
                         Action::Upgrade => todo!(),
                     }
@@ -173,7 +217,7 @@ fn spawn_worker_thread(server_addr: &SocketAddr, action: Action) -> mpsc::Unboun
 
 #[derive(Debug)]
 enum Resp {
-    Print(Vec<u8>),
+    Print(common::StdioBytes),
     Quit,
     Errored,
 }

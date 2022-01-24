@@ -53,6 +53,7 @@ impl fmt::Debug for SelfUpdate {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ServerUpdate {
     pub panicked: bool,
     pub stdio: StdioBytes,
@@ -73,12 +74,13 @@ impl fmt::Debug for StdioBytes {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub enum StdStream {
     Stdout,
     Stderr,
 }
 
+#[derive(Clone)]
 pub struct MessageReader {
     buf: Vec<u8>,
 }
@@ -91,7 +93,7 @@ impl MessageReader {
     pub async fn read_message<T, S>(&mut self, stream: &mut S) -> Result<T, MessageReadError>
     where
         for<'de> T: Deserialize<'de> + fmt::Debug,
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        S: tokio::io::AsyncRead + Unpin,
     {
         loop {
             use tokio::io::AsyncReadExt;
@@ -140,6 +142,7 @@ impl MessageReader {
     }
 }
 
+#[derive(Clone)]
 pub struct MessageWriter {
     buf: Vec<u8>,
 }
@@ -156,7 +159,7 @@ impl MessageWriter {
     ) -> Result<usize, MessageWriteError>
     where
         T: Serialize,
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        S: tokio::io::AsyncWrite + Unpin,
     {
         use tokio::io::AsyncWriteExt;
 

@@ -1,10 +1,15 @@
-use std::{
-    env, io, mem,
-    net::{Ipv4Addr, SocketAddrV4},
-    process::Stdio,
-};
+use std::env;
+use std::io;
+use std::mem;
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::process::Stdio;
+use std::sync::Arc;
 
-use tokio::{net::TcpListener, process::Command};
+use tokio::net::TcpListener;
+use tokio::process::Command;
+use tokio::sync::mpsc;
+use tokio::sync::OnceCell;
+use tracing::trace;
 use tracing::{debug, error, Level};
 use tracing_subscriber::{fmt::format, FmtSubscriber};
 
@@ -15,6 +20,15 @@ macro_rules! lc_err {
             Err(err) => {
                 error!("{err}");
                 continue;
+            }
+        }
+    };
+    ($e:expr, $label:lifetime) => {
+        match $e {
+            Ok(ok) => ok,
+            Err(err) => {
+                error!("{err}");
+                continue $label;
             }
         }
     };
@@ -29,6 +43,7 @@ fn main() {
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
+        .enable_time()
         .build()
         .unwrap();
     let _guard = rt.enter();
@@ -86,7 +101,10 @@ fn main() {
 
                     // FIXME: Signal potential write errors back to the client...
                     debug!("Writing executable data to ./{}", executable.name);
-                    let path = env::current_dir().unwrap().join(&executable.name);
+                    let path = env::current_dir()
+                        .unwrap()
+                        .join("target")
+                        .join(&executable.name);
                     let mut file = tokio::fs::File::create(&path).await.unwrap();
                     file.write_all(&executable.data).await.unwrap();
                     make_executable(&file).await.unwrap();
@@ -95,19 +113,89 @@ fn main() {
                     debug!("Running {}", executable.name);
                     let mut cmd = Command::new(path);
                     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-                    let process = cmd.spawn().unwrap();
-                    tokio::spawn(async move {
-                        // TODO: Process stdout and stdin here and send them to the client
-                    });
-                    tokio::spawn(async move {
-                        let _stdout = process.stdout.unwrap();
-                    });
-                    tokio::spawn(async move {
-                        let _stderr = process.stderr.unwrap();
-                    });
+                    let (iotx, mut iorx) = mpsc::channel(1);
+                    let mut process = cmd.spawn().unwrap();
+                    let stdio_err = Arc::new(OnceCell::new());
 
-                    // Temporary dummy read
-                    lc_err!(mread.read_message::<(), _>(&mut stream).await);
+                    trace!("Spawing worker tasks");
+                    tokio::spawn({
+                        let stdout = process.stdout.take().unwrap();
+                        redirect_stdio(
+                            iotx.clone(),
+                            common::StdStream::Stdout,
+                            stdout,
+                            stdio_err.clone(),
+                        )
+                    });
+                    tokio::spawn({
+                        let stderr = process.stderr.take().unwrap();
+                        redirect_stdio(
+                            iotx.clone(),
+                            common::StdStream::Stderr,
+                            stderr,
+                            stdio_err.clone(),
+                        )
+                    });
+                    let (rstream, mut wstream) = stream.into_split();
+                    tokio::spawn({
+                        async move {
+                            loop {
+                                if let Some(_) = stdio_err.get() {
+                                    trace!("Error set");
+                                    break;
+                                }
+                                match rstream.try_read(&mut [0]) {
+                                    Ok(written) => {
+                                        if written == 0 {
+                                            error!(
+                                                "0 bytes read. Assuming the client disconnected..."
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    Err(err) => match err.kind() {
+                                        io::ErrorKind::WouldBlock => {}
+                                        _ => {
+                                            error!("{err}");
+                                            break;
+                                        }
+                                    },
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                            iotx.send(InternalMessage::Stop).await.unwrap();
+                        }
+                    });
+                    trace!("Entering loop");
+                    loop {
+                        if let Some(msg) = iorx.recv().await {
+                            match msg {
+                                InternalMessage::Stdio(stdio) => {
+                                    if let Err(err) = mwrite
+                                        .write_message(
+                                            &mut wstream,
+                                            &common::ServerUpdate {
+                                                panicked: false,
+                                                stdio,
+                                            },
+                                        )
+                                        .await
+                                    {
+                                        error!("Failed to write message to stream: {err}");
+                                        break;
+                                    }
+                                }
+                                InternalMessage::Stop => {
+                                    trace!("Stop message received");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    trace!("Exiting loop ... killing process");
+                    if let Err(err) = process.kill().await {
+                        error!("Failed to kill process: {err}");
+                    }
                 }
                 common::ServerCmd::UpgradeSelf(_upgrade) => {
                     todo!();
@@ -115,6 +203,40 @@ fn main() {
             }
         }
     });
+}
+
+#[derive(Debug)]
+enum InternalMessage {
+    Stdio(common::StdioBytes),
+    Stop,
+}
+
+async fn redirect_stdio<S>(
+    iotx: mpsc::Sender<InternalMessage>,
+    stream: common::StdStream,
+    mut stdio: S,
+    err: Arc<OnceCell<io::Error>>,
+) where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    while !err.initialized() {
+        if let Err(e) = stdio.read_buf(&mut buf).await {
+            error!("Reading from {stream:?} failed: {e}");
+            let _ = err.set(e);
+            return;
+        }
+        if !buf.is_empty() {
+            iotx.send(InternalMessage::Stdio(common::StdioBytes {
+                stream,
+                data: buf.clone(),
+            }))
+            .await
+            .unwrap();
+            buf.clear();
+        }
+    }
 }
 
 async fn make_executable(file: &tokio::fs::File) -> io::Result<()> {
