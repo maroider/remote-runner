@@ -1,7 +1,6 @@
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use console::style;
@@ -159,13 +158,12 @@ fn spawn_worker_thread(server_addr: &SocketAddr, action: Action) -> mpsc::Unboun
                             }
 
                             let (itx, mut irx) = mpsc::channel(1);
-                            let (mut rstream, wstream) = stream.into_split();
                             tokio::spawn({
                                 let itx = itx;
                                 async move {
                                     loop {
                                         let update = mread
-                                            .read_message::<common::ServerUpdate, _>(&mut rstream)
+                                            .read_message::<common::ServerUpdate, _>(&mut stream)
                                             .await
                                             .unwrap();
                                         if update.panicked {

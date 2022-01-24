@@ -9,7 +9,6 @@ use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::OnceCell;
-use tracing::info;
 use tracing::trace;
 use tracing::{debug, error, Level};
 use tracing_subscriber::{fmt::format, FmtSubscriber};
