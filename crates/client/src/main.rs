@@ -10,8 +10,6 @@ use tokio::sync::mpsc;
 use tracing_subscriber::fmt::format;
 use tracing_subscriber::FmtSubscriber;
 
-static CTRL_C: AtomicBool = AtomicBool::new(false);
-
 fn main() {
     let subscriber = FmtSubscriber::builder()
         .event_format(format::format().pretty().with_source_location(true))
@@ -29,8 +27,6 @@ fn main() {
         .map(|var| var.parse().expect("Malformed socket address"))
         .unwrap_or(common::default_socket_address().into());
 
-    ctrlc::set_handler(|| CTRL_C.store(true, Ordering::SeqCst))
-        .expect("Could not set Ctrl+C handler");
     let mut rx = spawn_worker_thread(&server_addr, action);
 
     loop {
@@ -53,11 +49,6 @@ fn main() {
                 let mut stdout = stdout.lock();
                 stdout.write_all(&stdio.data).unwrap();
                 stdout.flush().unwrap();
-            }
-            Resp::Quit => {
-                // Make the prompt print nicely after Ctrl+C
-                println!();
-                break;
             }
             Resp::Errored => {
                 break;
@@ -165,22 +156,10 @@ fn spawn_worker_thread(server_addr: &SocketAddr, action: Action) -> mpsc::Unboun
                             #[derive(Debug)]
                             enum InternalMsg {
                                 Stdio(common::StdioBytes),
-                                Quit,
                             }
 
                             let (itx, mut irx) = mpsc::channel(1);
                             let (mut rstream, wstream) = stream.into_split();
-                            tokio::spawn({
-                                let itx = itx.clone();
-                                async move {
-                                    while !CTRL_C.load(Ordering::SeqCst) {
-                                        tokio::time::sleep(std::time::Duration::from_millis(100))
-                                            .await;
-                                    }
-                                    itx.send(InternalMsg::Quit).await.unwrap();
-                                    wstream.forget();
-                                }
-                            });
                             tokio::spawn({
                                 let itx = itx;
                                 async move {
@@ -201,7 +180,6 @@ fn spawn_worker_thread(server_addr: &SocketAddr, action: Action) -> mpsc::Unboun
                                     InternalMsg::Stdio(stdio) => {
                                         tx.send(Resp::Print(stdio)).unwrap()
                                     }
-                                    InternalMsg::Quit => tx.send(Resp::Quit).unwrap(),
                                 }
                             }
                         }
@@ -218,6 +196,5 @@ fn spawn_worker_thread(server_addr: &SocketAddr, action: Action) -> mpsc::Unboun
 #[derive(Debug)]
 enum Resp {
     Print(common::StdioBytes),
-    Quit,
     Errored,
 }
