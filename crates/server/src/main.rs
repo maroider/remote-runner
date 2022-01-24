@@ -163,7 +163,7 @@ fn main() {
                                         }
                                     },
                                 }
-                                if process.try_wait().is_ok() {
+                                if process.try_wait().map_or(false, |status| status.is_some()) {
                                     debug!("Process exited on its own");
                                     break InternalMessage::ProcessExited;
                                 }
