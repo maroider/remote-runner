@@ -201,6 +201,7 @@ fn main() {
                             }
                         }
                     };
+                    wstream.shutdown().await.unwrap();
                     if stop_process {
                         trace!("Exiting loop ... killing process");
                         if let Err(err) = process.await.unwrap().kill().await {
