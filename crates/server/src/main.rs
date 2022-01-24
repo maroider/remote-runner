@@ -67,6 +67,9 @@ fn main() {
                     continue;
                 }
             };
+            stream
+                .set_linger(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
             debug!("Accepted connection on {}", peer_socket_addr);
             lc_err!(
                 mwrite

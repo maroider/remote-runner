@@ -109,6 +109,9 @@ fn spawn_worker_thread(server_addr: &SocketAddr, action: Action) -> mpsc::Unboun
 
             match TcpStream::connect(&server_addr).await {
                 Ok(mut stream) => {
+                    stream
+                        .set_linger(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
                     let _server_version = mread
                         .read_message::<common::Version, _>(&mut stream)
                         .await
