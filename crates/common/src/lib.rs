@@ -98,6 +98,7 @@ impl MessageReader {
         loop {
             use tokio::io::AsyncReadExt;
 
+            trace!("Starting to read into buffer...");
             match stream.read_buf(&mut self.buf).await {
                 Ok(num) => {
                     if num == 0 {

@@ -5,7 +5,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::process::Stdio;
 use std::sync::Arc;
 
-use tokio::net::TcpListener;
+use tokio::net::TcpSocket;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::OnceCell;
@@ -47,17 +47,16 @@ fn main() {
         .build()
         .unwrap();
     let _guard = rt.enter();
-    rt.block_on(async {
-        let listener = TcpListener::bind(SocketAddrV4::new(
-            Ipv4Addr::UNSPECIFIED,
-            common::default_port(),
-        ))
-        .await
+    let socket = TcpSocket::new_v4().unwrap();
+    socket
+        .bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, common::default_port()).into())
         .unwrap();
+    let listener = socket.listen(256).unwrap();
 
-        let mut mread = common::MessageReader::new();
-        let mut mwrite = common::MessageWriter::new();
+    let mut mread = common::MessageReader::new();
+    let mut mwrite = common::MessageWriter::new();
 
+    rt.block_on(async {
         loop {
             debug!("Listening for new connections");
             let (mut stream, peer_socket_addr) = match listener.accept().await {
@@ -67,9 +66,6 @@ fn main() {
                     continue;
                 }
             };
-            stream
-                .set_linger(Some(std::time::Duration::from_secs(3)))
-                .unwrap();
             debug!("Accepted connection on {}", peer_socket_addr);
             lc_err!(
                 mwrite

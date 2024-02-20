@@ -1,10 +1,11 @@
 use std::env;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::thread;
 
 use console::style;
-use tokio::net::TcpStream;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpSocket;
 use tokio::sync::mpsc;
 use tracing_subscriber::fmt::format;
 use tracing_subscriber::FmtSubscriber;
@@ -23,7 +24,14 @@ fn main() {
         Action::Run(PathBuf::from(arg))
     };
     let server_addr: SocketAddr = env::var("REMOTE_RUNNER_SERVER")
-        .map(|var| var.parse().expect("Malformed socket address"))
+        .map(|var| {
+            var.parse::<IpAddr>()
+                .map(|addr| SocketAddr::new(addr, common::default_port()))
+                .unwrap_or_else(|_| {
+                    var.parse()
+                        .expect("REMOTE_RUNNER_SERVER does not contain a valid IP addres or IP address and socket combo")
+                })
+        })
         .unwrap_or(common::default_socket_address().into());
 
     let mut rx = spawn_worker_thread(&server_addr, action);
@@ -107,11 +115,10 @@ fn spawn_worker_thread(server_addr: &SocketAddr, action: Action) -> mpsc::Unboun
             let mut mread = common::MessageReader::new();
             let mut mwrite = common::MessageWriter::new();
 
-            match TcpStream::connect(&server_addr).await {
+            let socket = TcpSocket::new_v4().unwrap();
+
+            match socket.connect(server_addr).await {
                 Ok(mut stream) => {
-                    stream
-                        .set_linger(Some(std::time::Duration::from_secs(5)))
-                        .unwrap();
                     let _server_version = mread
                         .read_message::<common::Version, _>(&mut stream)
                         .await
@@ -165,14 +172,23 @@ fn spawn_worker_thread(server_addr: &SocketAddr, action: Action) -> mpsc::Unboun
                                 let itx = itx;
                                 async move {
                                     loop {
-                                        let update = mread
+                                        match mread
                                             .read_message::<common::ServerUpdate, _>(&mut stream)
                                             .await
-                                            .unwrap();
-                                        if update.panicked {
-                                            // TODO: Is this even useful?
-                                        }
-                                        itx.send(InternalMsg::Stdio(update.stdio)).await.unwrap();
+                                        {
+                                            Ok(update) => {
+                                                if update.panicked {
+                                                    // TODO: Is this even useful?
+                                                }
+                                                itx.send(InternalMsg::Stdio(update.stdio))
+                                                    .await
+                                                    .unwrap();
+                                            }
+                                            Err(err) => {
+                                                stream.shutdown().await.unwrap();
+                                                panic!("{err:?}");
+                                            }
+                                        };
                                     }
                                 }
                             });
