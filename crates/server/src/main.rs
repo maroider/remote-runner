@@ -99,11 +99,10 @@ fn main() {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
                     // FIXME: Signal potential write errors back to the client...
-                    debug!("Writing executable data to ./{}", executable.name);
-                    let path = env::current_dir()
-                        .unwrap()
-                        .join("target")
-                        .join(&executable.name);
+                    let path = env::current_dir().unwrap().join("target");
+                    tokio::fs::create_dir_all(&path).await.unwrap();
+                    let path = path.join(&executable.name);
+                    debug!("Writing executable data to {:?}", path);
                     let mut file = tokio::fs::File::create(&path).await.unwrap();
                     file.write_all(&executable.data).await.unwrap();
                     make_executable(&file).await.unwrap();
