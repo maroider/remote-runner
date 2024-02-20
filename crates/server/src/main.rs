@@ -109,10 +109,25 @@ fn main() {
                     mem::drop(file);
 
                     debug!("Running {}", executable.name);
-                    let mut cmd = Command::new(path);
+                    let mut cmd = Command::new(&path);
                     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
                     let (iotx, mut iorx) = mpsc::channel(1);
-                    let mut process = cmd.spawn().unwrap();
+                    let mut process = loop {
+                        match cmd.spawn() {
+                            Ok(process) => break process,
+                            Err(err) => {
+                                #[cfg(target_os = "windows")]
+                                if let Some(err) = err.raw_os_error() {
+                                    if err == 32 {
+                                        // Some other process is using the file... just keep trying
+                                        // for now
+                                        continue;
+                                    }
+                                }
+                                panic!("Could not run executable {path:?}: {err}");
+                            }
+                        }
+                    };
                     let stdio_err = Arc::new(OnceCell::new());
 
                     trace!("Spawing worker tasks");
